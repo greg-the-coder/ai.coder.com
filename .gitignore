@@ -1,0 +1,48 @@
+# Terraform
+.terraform/
+.terraform.lock.hcl
+terraform.tfstate*
+**.tfvars**
+tf.plan
+
+# Helm + Kubernetes
+infra/aws/us-east-2/apps/coder-ws/experiment/prometheus.yaml
+infra/aws/us-east-2/apps/coder-devel/build-and-push
+infra/aws/us-east-2/apps/cert-manager
+coder-observability/
+observability/
+charts/
+secrets/
+
+# Python
+.venv
+
+# Temporary folders
+tmp/
+
+# vi/vim swap files
+.*.sw*
+.*.*.sw*
+
+# Cert files
+*.pem
+*.key
+*.crt
+*.csr
+*.pem
+*.key
+*.crt
+
+# OS/Editor junk
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# Scripts
+init.sh
+plan.sh
+annotate.sh
+
+# GG Cache Shield
+.cache_ggshield

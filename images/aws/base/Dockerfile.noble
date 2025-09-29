@@ -1,0 +1,67 @@
+FROM --platform=linux/amd64 ubuntu:noble AS ubuntu_noble_amd64
+
+SHELL ["/bin/bash", "-c"]
+ENV DEBIAN_FRONTEND=noninteractive
+
+# Install the Docker apt repository
+RUN apt update && \
+    apt upgrade -y --no-install-recommends --no-install-suggests && \
+    apt install -y --no-install-recommends --no-install-suggests \
+        ca-certificates gnupg2 curl wget \
+        software-properties-common build-essential && \
+    rm -rf /var/lib/apt/lists/*
+
+# Add GPG keys
+RUN curl -fsSL https://deb.nodesource.com/gpgkey/nodesource-repo.gpg.key | gpg --dearmor -o /etc/apt/keyrings/nodesource.gpg && \
+    curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg | gpg --dearmor -o /etc/apt/keyrings/githubcli-archive-keyring.gpg
+
+
+# Add Apt repos
+RUN echo "deb [arch=amd64 signed-by=/etc/apt/keyrings/nodesource.gpg] https://deb.nodesource.com/node_24.x nodistro main" | tee /etc/apt/sources.list.d/nodesource.list && \
+    echo "deb [arch=amd64 signed-by=/etc/apt/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" | tee /etc/apt/sources.list.d/github-cli.list && \
+    add-apt-repository "ppa:git-core/ppa"
+
+# Install baseline packages
+RUN apt update && \
+    apt install -y --no-install-recommends --no-install-suggests \
+        git gh vim tmux \
+        openssh-client \
+        lsof jq \
+        locales \
+        sudo man \
+        unzip \
+        nodejs && \
+    rm -rf /var/lib/apt/lists/*
+
+# Playwright Testing Dependencies
+RUN apt update && \
+    apt install -y --no-install-recommends --no-install-suggests \
+        libnss3 libnspr4 \
+        libatk1.0-0 libatk-bridge2.0-0 libatspi2.0-0 \
+        libx11-6 libxcomposite1 libxdamage1 libxext6 libxfixes3 libxrandr2 libgbm1 libxkbcommon0 libasound2t64 && \
+    rm -rf /var/lib/apt/lists/*
+
+# Generate the desired locale (en_US.UTF-8)
+RUN locale-gen en_US.UTF-8
+
+# Make typing unicode characters in the terminal work.
+ENV LANG=en_US.UTF-8
+ENV LANGUAGE=en_US.UTF-8
+ENV LC_ALL=en_US.UTF-8
+
+# Remove the `ubuntu` user and add a user `coder` so that you're not developing as the `root` user
+RUN userdel -r ubuntu && \
+    useradd coder \
+    --create-home \
+    --shell=/bin/bash \
+    --uid=1000 \
+    --user-group && \
+    echo "coder ALL=(ALL) NOPASSWD:ALL" >> /etc/sudoers.d/nopasswd
+
+USER coder
+
+ENV HOME=/home/coder
+ENV PATH=$PATH:$HOME/bin
+WORKDIR $HOME
+
+RUN npm config set prefix=$HOME
