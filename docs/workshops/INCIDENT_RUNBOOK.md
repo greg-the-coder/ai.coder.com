@@ -47,39 +47,67 @@ This runbook provides step-by-step procedures for diagnosing and resolving commo
 - Ephemeral volume storage exhaustion
 - Resource contention (CPU, memory)
 - Node capacity exceeded
+- LiteLLM auxiliary addon key rotation (occurs every 4-5 hours, forces workspace restarts)
 
 **Diagnosis**:
 
 ```bash
-# Check node storage
-kubectl top nodes
-kubectl get nodes -o wide
+# Check node storage across all regions
+kubectl top nodes --context=us-east-2
+kubectl top nodes --context=us-west-2
+kubectl top nodes --context=eu-west-2
+
+kubectl get nodes -o wide --context=us-east-2
 
 # Check ephemeral volume usage
 kubectl get pods -A -o json | jq '.items[] | select(.spec.volumes != null) | {name: .metadata.name, namespace: .metadata.namespace, volumes: [.spec.volumes[] | select(.emptyDir != null)]}'
 
-# Check for evicted pods
-kubectl get pods -A | grep Evicted
+# Check for evicted pods across all regions
+kubectl get pods -A --context=us-east-2 | grep Evicted
+kubectl get pods -A --context=us-west-2 | grep Evicted
+kubectl get pods -A --context=eu-west-2 | grep Evicted
 
 # Check workspace pod events
 kubectl describe pod <workspace-pod-name> -n <namespace>
 
 # Check Karpenter node allocation
-kubectl logs -l app.kubernetes.io/name=karpenter -n karpenter --tail=100
+kubectl logs -l app.kubernetes.io/name=karpenter -n karpenter --tail=100 --context=us-east-2
+
+# Check if LiteLLM key rotation is happening
+kubectl logs -l app=litellm-key-rotator -n litellm --tail=50
 ```
 
 **Resolution**:
 
 **Immediate**:
-1. Identify workspaces consuming excessive storage:
+1. **If caused by LiteLLM key rotation during workshop**:
+   ```bash
+   # Temporarily disable the auxiliary addon key rotation
+   kubectl scale deployment litellm-key-rotator -n litellm --replicas=0
+   
+   # Workshop facilitators: Warn participants that workspaces may restart
+   # Re-enable after workshop completes
+   ```
+
+2. Identify workspaces consuming excessive storage:
    ```bash
    kubectl exec -it <workspace-pod> -- df -h
    ```
-2. If specific workspace is problematic, delete it:
+3. If specific workspace is problematic, delete it:
    ```bash
    kubectl delete pod <workspace-pod> -n <namespace>
    ```
-3. If cluster-wide issue, scale up nodes or increase storage capacity
+4. If cluster-wide issue, trigger Karpenter scaling or manually add nodes:
+   ```bash
+   # Check current NodePool capacity
+   kubectl get nodepool --context=us-east-2
+   
+   # Check pending NodeClaims
+   kubectl get nodeclaims -A --context=us-east-2
+   
+   # If Karpenter not scaling, check logs for issues
+   kubectl logs -l app.kubernetes.io/name=karpenter -n karpenter --tail=200
+   ```
 
 **Temporary Workaround**:
 - Pause new workspace deployments
@@ -100,38 +128,78 @@ kubectl logs -l app.kubernetes.io/name=karpenter -n karpenter --tail=100
 
 **Likely Causes**:
 - Image version mismatch between control plane and proxy clusters
+- Private ECR mirror out of sync with `ghcr.io/coder/coder-preview`
+- CloudFlare DNS misconfiguration
 - Ingress controller misconfiguration
 - DNS propagation delays
 
 **Diagnosis**:
 
 ```bash
-# Check Coder image versions across clusters
-kubectl get pods -n coder -o jsonpath='{.items[*].spec.containers[*].image}' --context=control-plane
-kubectl get pods -n coder -o jsonpath='{.items[*].spec.containers[*].image}' --context=oregon
-kubectl get pods -n coder -o jsonpath='{.items[*].spec.containers[*].image}' --context=london
+# Check Coder image versions across all clusters (must be identical)
+kubectl get pods -n coder -o jsonpath='{.items[*].spec.containers[*].image}' --context=us-east-2
+kubectl get pods -n coder -o jsonpath='{.items[*].spec.containers[*].image}' --context=us-west-2
+kubectl get pods -n coder -o jsonpath='{.items[*].spec.containers[*].image}' --context=eu-west-2
 
-# Check ingress configuration
-kubectl get ingress -A
-kubectl describe ingress <ingress-name> -n <namespace>
+# Verify private ECR mirror is up-to-date
+crane digest ghcr.io/coder/coder-preview:latest
+aws ecr describe-images --repository-name coder-preview --region us-east-2 --query 'sort_by(imageDetails,& imagePushedAt)[-1].imageDigest'
 
-# Check DNS resolution
-dig <workspace-subdomain>.ai.coder.com
-nslookup <workspace-subdomain>.ai.coder.com
+# Check proxy configurations
+kubectl get svc -n coder --context=us-east-2
+kubectl get svc -n coder --context=us-west-2
+kubectl get svc -n coder --context=eu-west-2
 
-# Check load balancer status
-kubectl get svc -n coder
+# Check CloudFlare DNS resolution for all domains
+dig ai.coder.com
+dig oregon-proxy.ai.coder.com
+dig emea-proxy.ai.coder.com
+dig test-workspace.ai.coder.com
+dig test-workspace.oregon-proxy.ai.coder.com
+dig test-workspace.emea-proxy.ai.coder.com
+
+# Check Network Load Balancers (NLB) are healthy
+kubectl get svc -n coder -o wide
+
+# Test proxy endpoints
+curl -I https://ai.coder.com/healthz
+curl -I https://oregon-proxy.ai.coder.com/healthz
+curl -I https://emea-proxy.ai.coder.com/healthz
 ```
 
 **Resolution**:
 
 **Immediate**:
-1. Verify image versions match across clusters
-2. If mismatch found, restart Coder pods in affected cluster:
+1. **If ECR mirror is out of sync**:
    ```bash
-   kubectl rollout restart deployment/coder -n coder
+   # Pull latest preview image and push to ECR
+   docker pull ghcr.io/coder/coder-preview:latest
+   docker tag ghcr.io/coder/coder-preview:latest <aws-account-id>.dkr.ecr.us-east-2.amazonaws.com/coder-preview:latest
+   aws ecr get-login-password --region us-east-2 | docker login --username AWS --password-stdin <aws-account-id>.dkr.ecr.us-east-2.amazonaws.com
+   docker push <aws-account-id>.dkr.ecr.us-east-2.amazonaws.com/coder-preview:latest
+   
+   # Restart Coder pods in all regions
+   kubectl rollout restart deployment/coder -n coder --context=us-east-2
+   kubectl rollout restart deployment/coder -n coder --context=us-west-2
+   kubectl rollout restart deployment/coder -n coder --context=eu-west-2
    ```
-3. If DNS issue, wait for propagation or flush DNS cache
+
+2. **If image versions mismatch across clusters**:
+   ```bash
+   # Restart Coder pods in affected cluster
+   kubectl rollout restart deployment/coder -n coder --context=<affected-region>
+   
+   # Wait for rollout to complete
+   kubectl rollout status deployment/coder -n coder --context=<affected-region>
+   ```
+
+3. **If CloudFlare DNS issue**:
+   - Contact #help-me-ops on Slack immediately
+   - Provide: Which domain is failing, expected NLB address, current DNS resolution
+   - CloudFlare manages these domains:
+     - `ai.coder.com` + `*.ai.coder.com` → us-east-2 NLB
+     - `oregon-proxy.ai.coder.com` + `*.oregon-proxy.ai.coder.com` → us-west-2 NLB
+     - `emea-proxy.ai.coder.com` + `*.emea-proxy.ai.coder.com` → eu-west-2 NLB
 
 **Temporary Workaround**:
 - Direct users to working region
@@ -147,40 +215,75 @@ kubectl get svc -n coder
 **Symptoms**:
 - Users cannot authenticate
 - "Invalid API key" or similar errors
-- AI features not working
+- AI features not working (Claude Code CLI, Goose CLI)
+- Rate limiting errors
 
 **Likely Causes**:
-- Expired LiteLLM key
-- Rate limiting
-- Service outage
+- Expired AWS Bedrock or GCP Vertex credentials
+- LiteLLM auxiliary addon key rotation in progress (occurs every 4-5 hours)
+- Rate limiting from AWS Bedrock or GCP Vertex
+- LiteLLM service outage or pod crashes
+- LiteLLM capacity exceeded (4 replicas @ 2 vCPU / 4 GB each)
 
 **Diagnosis**:
 
 ```bash
-# Check LiteLLM pod logs
-kubectl logs -l app=litellm -n <namespace> --tail=100
+# Check LiteLLM pod status and logs
+kubectl get pods -n litellm -l app=litellm
+kubectl logs -l app=litellm -n litellm --tail=100
 
-# Test LiteLLM API key
-curl -H "Authorization: Bearer <api-key>" https://<litellm-endpoint>/v1/models
+# Check if key rotation is in progress
+kubectl logs -l app=litellm-key-rotator -n litellm --tail=50
 
-# Check key expiration (method depends on your key management)
-# TODO: Add specific command for your environment
+# Test LiteLLM endpoint
+curl -I https://<litellm-alb-endpoint>/health
+
+# Check AWS Bedrock credentials
+kubectl get secret litellm-aws-credentials -n litellm -o jsonpath='{.data}'
+
+# Check GCP Vertex credentials
+kubectl get secret litellm-gcp-credentials -n litellm -o jsonpath='{.data}'
+
+# Check LiteLLM resource usage
+kubectl top pods -n litellm
+
+# Test round-robin to AWS Bedrock and GCP Vertex
+kubectl exec -n litellm deploy/litellm -- curl -X POST https://bedrock-runtime.us-east-1.amazonaws.com/model/anthropic.claude-v2/invoke
 ```
 
 **Resolution**:
 
 **Immediate**:
-1. Verify key expiration date
-2. If expired, rotate key immediately:
+1. **If key rotation in progress during workshop**:
    ```bash
-   # Follow your key rotation procedure
-   # Update secret:
-   kubectl create secret generic litellm-key \
-     --from-literal=api-key=<new-key> \
-     --dry-run=client -o yaml | kubectl apply -f -
+   # Wait for rotation to complete (typically <5 minutes)
+   # Or temporarily pause rotation
+   kubectl scale deployment litellm-key-rotator -n litellm --replicas=0
+   
+   # Re-enable after workshop
+   kubectl scale deployment litellm-key-rotator -n litellm --replicas=1
+   ```
+
+2. **If LiteLLM capacity exceeded**:
+   ```bash
+   # Scale LiteLLM replicas from 4 to 6-8
+   kubectl scale deployment litellm -n litellm --replicas=6
+   
+   # Monitor scaling
+   kubectl get pods -n litellm -w
+   ```
+
+3. **If AWS/GCP credentials expired**:
+   ```bash
+   # Rotate AWS IAM role credentials
+   # Update secret with new credentials
+   kubectl create secret generic litellm-aws-credentials \
+     --from-literal=aws-access-key-id=<new-key> \
+     --from-literal=aws-secret-access-key=<new-secret> \
+     --dry-run=client -o yaml | kubectl apply -f - -n litellm
    
    # Restart LiteLLM pods
-   kubectl rollout restart deployment/litellm -n <namespace>
+   kubectl rollout restart deployment/litellm -n litellm
    ```
 
 **Temporary Workaround**:
@@ -198,37 +301,73 @@ curl -H "Authorization: Bearer <api-key>" https://<litellm-endpoint>/v1/models
 - Slow workspace performance
 - Timeouts during operations
 - Elevated CPU/memory usage across cluster
+- Provisioner jobs queuing or timing out
 
 **Likely Causes**:
-- Too many concurrent workspaces
+- Too many concurrent workspaces (workspaces use 2-4 vCPU, 4-8 GB each)
+- Insufficient provisioner replicas (default: 6, experimental/demo: 2 each)
 - Workload-heavy exercises
 - Insufficient node capacity
+- Karpenter not scaling fast enough
 
 **Diagnosis**:
 
 ```bash
-# Check cluster resource usage
-kubectl top nodes
-kubectl top pods -A
+# Check cluster resource usage across all regions
+kubectl top nodes --context=us-east-2
+kubectl top pods -A --context=us-east-2
+
+kubectl top nodes --context=us-west-2
+kubectl top nodes --context=eu-west-2
+
+# Check provisioner replica counts and status
+kubectl get deployment -n coder -l app=coder-provisioner -o wide
+kubectl get pods -n coder -l app=coder-provisioner
+
+# Check provisioner logs for queuing
+kubectl logs -n coder -l app=coder-provisioner --tail=100 | grep -i "queue\|wait\|timeout"
 
 # Check Karpenter scaling
-kubectl get nodeclaims -A
-kubectl logs -l app.kubernetes.io/name=karpenter -n karpenter --tail=50
+kubectl get nodeclaims -A --context=us-east-2
+kubectl get nodepool --context=us-east-2
+kubectl logs -l app.kubernetes.io/name=karpenter -n karpenter --tail=100
 
-# Check pod resource limits
-kubectl describe pod <pod-name> -n <namespace> | grep -A 5 "Limits\|Requests"
+# Check workspace pod resource limits
+kubectl describe pod <workspace-pod> -n <namespace> | grep -A 10 "Limits\|Requests"
+
+# Count concurrent workspaces
+kubectl get pods -A --context=us-east-2 | grep workspace | wc -l
 ```
 
 **Resolution**:
 
 **Immediate**:
-1. Trigger Karpenter to scale up nodes if not auto-scaling:
+1. **Scale provisioners** if jobs are queuing:
+   ```bash
+   # Scale default org provisioners from 6 to 10
+   kubectl scale deployment coder-provisioner-default -n coder --replicas=10
+   
+   # Scale experimental/demo if needed
+   kubectl scale deployment coder-provisioner-experimental -n coder --replicas=4
+   kubectl scale deployment coder-provisioner-demo -n coder --replicas=4
+   
+   # Monitor provisioner scaling
+   kubectl get pods -n coder -l app=coder-provisioner -w
+   ```
+
+2. **Trigger Karpenter to scale up nodes** if not auto-scaling:
    ```bash
    # Check Karpenter NodePool status
-   kubectl get nodepool
+   kubectl get nodepool --context=us-east-2
+   
+   # Check for pending pods that should trigger scaling
+   kubectl get pods -A --field-selector=status.phase=Pending
+   
+   # If Karpenter not scaling, check for errors
+   kubectl logs -l app.kubernetes.io/name=karpenter -n karpenter --tail=200 | grep -i error
    ```
-2. If nodes are at capacity, consider increasing instance sizes
-3. Identify and pause resource-heavy workloads
+
+3. If nodes are at capacity, consider increasing instance sizes or manually adding nodes
 
 **Temporary Workaround**:
 - Reduce concurrent workspace count
@@ -250,54 +389,164 @@ kubectl describe pod <pod-name> -n <namespace> | grep -A 5 "Limits\|Requests"
 - Slow workspace startup times
 
 **Likely Causes**:
-- Registry authentication issues
+- Private ECR registry authentication issues
 - Network connectivity problems
-- Rate limiting from container registry
-- Image doesn't exist or incorrect tag
+- Rate limiting from ECR or GHCR
+- Image doesn't exist or incorrect tag in private ECR
+- ECR mirror out of sync with `ghcr.io/coder/coder-preview`
 
 **Diagnosis**:
 
 ```bash
-# Check pod status
+# Check pod status for image pull errors
 kubectl get pods -A | grep -E 'ImagePull|ErrImagePull'
 
 # Check pod events
-kubectl describe pod <pod-name> -n <namespace>
+kubectl describe pod <pod-name> -n <namespace> | grep -A 10 Events
 
 # Check image pull secrets
+kubectl get secrets -A | grep ecr
 kubectl get secrets -A | grep docker
 
-# Verify image exists
-docker pull <image-name>:<tag>
-# or
-crane manifest <image-name>:<tag>
+# Verify workspace image exists in private ECR
+aws ecr describe-images --repository-name <workspace-image-repo> --region us-east-2
+
+# Verify Coder image exists and is latest
+aws ecr describe-images --repository-name coder-preview --region us-east-2 --query 'sort_by(imageDetails,& imagePushedAt)[-1]'
+crane digest ghcr.io/coder/coder-preview:latest
+
+# Test image pull from ECR
+docker pull <aws-account-id>.dkr.ecr.us-east-2.amazonaws.com/coder-preview:latest
 ```
 
 **Resolution**:
 
 **Immediate**:
-1. Verify registry credentials are valid:
+1. **If ECR authentication issue**:
    ```bash
-   kubectl get secret <image-pull-secret> -n <namespace> -o jsonpath='{.data.dockerconfigjson}' | base64 -d
+   # Re-authenticate with ECR
+   aws ecr get-login-password --region us-east-2 | docker login --username AWS --password-stdin <aws-account-id>.dkr.ecr.us-east-2.amazonaws.com
+   
+   # Update ECR pull secret in cluster
+   kubectl create secret docker-registry ecr-pull-secret \
+     --docker-server=<aws-account-id>.dkr.ecr.us-east-2.amazonaws.com \
+     --docker-username=AWS \
+     --docker-password=$(aws ecr get-login-password --region us-east-2) \
+     -n <namespace> --dry-run=client -o yaml | kubectl apply -f -
+   
+   # Restart affected pods
+   kubectl delete pod <pod-name> -n <namespace>
    ```
-2. Re-create image pull secret if expired:
+
+2. **If ECR mirror is out of sync**:
    ```bash
-   kubectl create secret docker-registry <secret-name> \
-     --docker-server=<registry> \
-     --docker-username=<username> \
-     --docker-password=<password> \
-     -n <namespace>
+   # Pull latest from GHCR and push to private ECR
+   docker pull ghcr.io/coder/coder-preview:latest
+   docker tag ghcr.io/coder/coder-preview:latest <aws-account-id>.dkr.ecr.us-east-2.amazonaws.com/coder-preview:latest
+   docker push <aws-account-id>.dkr.ecr.us-east-2.amazonaws.com/coder-preview:latest
    ```
-3. Restart affected pods
+
+3. **If workspace image missing**:
+   ```bash
+   # Check which workspace images are required
+   # Templates use images from private ECR:
+   # - Build from Scratch w/ Claude
+   # - Build from Scratch w/ Goose  
+   # - Real World App w/ Claude (uses codercom/example-universal:ubuntu from DockerHub)
+   
+   # Verify images exist in ECR
+   aws ecr describe-repositories --region us-east-2 | grep -E 'claude|goose'
+   ```
+
+4. Restart affected pods
 
 **Temporary Workaround**:
-- Use cached images if available
-- Switch to alternative image registry
+- Use cached images if available on nodes
+- Switch workshop participants to Real World App w/ Claude template (uses DockerHub instead of ECR)
+- For critical issue, fall back to public DockerHub images if available
 
 **Permanent Fix**:
 - Implement image pre-caching on nodes
 - Use image pull secrets with longer expiration
 - See GitHub Issue #2 for image management improvements
+
+---
+
+### 6. Provisioner Failures
+
+**Symptoms**:
+- Workspaces stuck in "Pending" or "Starting" state
+- Workspace create/delete/update operations timeout
+- Provisioner job errors in Coder UI
+
+**Likely Causes**:
+- Insufficient provisioner replicas (default: 6, needs 8-10 for >15 users)
+- Provisioner pod resource limits reached (500m CPU, 512 MB memory each)
+- AWS IAM role issues for workspace provisioning
+- Terraform state lock issues
+
+**Diagnosis**:
+
+```bash
+# Check provisioner pod status
+kubectl get pods -n coder -l app=coder-provisioner
+
+# Check provisioner logs for errors
+kubectl logs -n coder -l app=coder-provisioner --tail=200 | grep -i "error\|failed\|timeout"
+
+# Check provisioner resource usage
+kubectl top pods -n coder -l app=coder-provisioner
+
+# Check how many provisioner jobs are running
+kubectl logs -n coder -l app=coder-provisioner --tail=500 | grep -c "Acquired job"
+
+# Check AWS IAM role used by provisioners
+kubectl get sa coder-provisioner -n coder -o yaml | grep -A 5 annotations
+
+# Check Coder API for provisioner status
+curl -H "Coder-Session-Token: $CODER_SESSION_TOKEN" https://ai.coder.com/api/v2/provisioners
+```
+
+**Resolution**:
+
+**Immediate**:
+1. **Scale provisioner replicas**:
+   ```bash
+   # Current state: 6 replicas (default org)
+   # Scale to 10 for workshops with >15 users
+   kubectl scale deployment coder-provisioner-default -n coder --replicas=10
+   
+   # Monitor scaling
+   kubectl get pods -n coder -l app=coder-provisioner -w
+   ```
+
+2. **If provisioners are OOMKilled or CPU throttled**:
+   ```bash
+   # Check for OOMKilled
+   kubectl get pods -n coder -l app=coder-provisioner -o jsonpath='{range .items[*]}{.metadata.name}{"\t"}{.status.containerStatuses[0].lastState.terminated.reason}{"\n"}{end}'
+   
+   # Temporarily increase resource limits (requires Helm/Terraform change)
+   # Edit deployment to increase from 500m CPU / 512 MB to 1 CPU / 1 GB
+   kubectl edit deployment coder-provisioner-default -n coder
+   ```
+
+3. **If AWS IAM role issue**:
+   ```bash
+   # Verify IAM role is properly attached
+   kubectl describe sa coder-provisioner -n coder
+   
+   # Test AWS permissions from provisioner pod
+   kubectl exec -n coder deploy/coder-provisioner-default -- aws sts get-caller-identity
+   ```
+
+**Temporary Workaround**:
+- Stagger workspace deployments
+- Ask participants to avoid simultaneous create/delete operations
+- Prioritize workspace starts over deletes
+
+**Permanent Fix**:
+- See new GitHub issue for provisioner scaling automation
+- Consider implementing provisioner autoscaling based on queue depth
 
 ---
 

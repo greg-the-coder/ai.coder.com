@@ -15,12 +15,24 @@ This checklist ensures all systems are operational and properly configured befor
 
 ### LiteLLM Keys
 
-- [ ] **Check key expiration**: Keys must be valid for >7 days
+- [ ] **Check AWS Bedrock credentials expiration**:
   ```bash
-  # Command to check key expiration
-  # TODO: Add specific command for your environment
+  # Check AWS IAM role credentials used by LiteLLM
+  kubectl get secret litellm-aws-credentials -n litellm -o jsonpath='{.data}' | base64 -d
+  
+  # Verify AWS Bedrock access
+  kubectl exec -n litellm deploy/litellm -- curl -X GET https://bedrock-runtime.us-east-1.amazonaws.com/
   ```
-- [ ] **Result**: Expires on: _________________
+- [ ] **Check GCP Vertex credentials expiration**:
+  ```bash
+  # Check GCP service account key expiration
+  kubectl get secret litellm-gcp-credentials -n litellm -o jsonpath='{.data}' | base64 -d
+  ```
+- [ ] **Verify auxiliary addon key rotation schedule**: Keys rotate every 4-5 hours
+  - [ ] **Action Required**: Ensure rotation will NOT occur during workshop window
+  - [ ] **Note**: Key rotation forces all workspaces to restart
+- [ ] **Result**: AWS credentials expire on: _________________
+- [ ] **Result**: GCP credentials expire on: _________________
 - [ ] **Action Required**: If <7 days, rotate keys using documented procedure
 
 ### GitHub OAuth
@@ -35,39 +47,77 @@ This checklist ensures all systems are operational and properly configured befor
 
 ### Image Consistency
 
-- [ ] **Control Plane** - Verify Coder image version:
+**Expected Image**: `ghcr.io/coder/coder-preview` (mirrored to private ECR)
+
+- [ ] **Control Plane (us-east-2)** - Verify Coder Server image version:
   ```bash
-  # kubectl get pods -n coder -o jsonpath='{.items[*].spec.containers[*].image}'
+  kubectl get pods -n coder -o jsonpath='{.items[*].spec.containers[*].image}' --context=us-east-2
   ```
   - Image: _________________
   - Tag/Digest: _________________
 
-- [ ] **Oregon Proxy Cluster** - Verify Coder image version:
+- [ ] **Oregon Proxy (us-west-2)** - Verify Coder Proxy image version:
+  ```bash
+  kubectl get pods -n coder -o jsonpath='{.items[*].spec.containers[*].image}' --context=us-west-2
+  ```
   - Image: _________________
   - Tag/Digest: _________________
 
-- [ ] **London Proxy Cluster** - Verify Coder image version:
+- [ ] **London Proxy (eu-west-2)** - Verify Coder Proxy image version:
+  ```bash
+  kubectl get pods -n coder -o jsonpath='{.items[*].spec.containers[*].image}' --context=eu-west-2
+  ```
   - Image: _________________
   - Tag/Digest: _________________
 
-- [ ] **Confirm all clusters use identical images**
+- [ ] **Verify private ECR mirror** is up-to-date with latest `ghcr.io/coder/coder-preview`:
+  ```bash
+  # Get latest digest from GitHub Container Registry
+  crane digest ghcr.io/coder/coder-preview:latest
+  
+  # Get digest from private ECR
+  aws ecr describe-images --repository-name coder-preview --region us-east-2 --query 'sort_by(imageDetails,& imagePushedAt)[-1].imageDigest'
+  ```
+  - GHCR Digest: _________________
+  - ECR Digest: _________________
+
+- [ ] **Confirm all clusters use identical images and digests**
 - [ ] **Action Required**: If images differ, see Issue #2 for remediation
+
+### CloudFlare DNS Verification
+
+- [ ] **Verify DNS records in CloudFlare** (request via #help-me-ops Slack channel if needed):
+  - [ ] `ai.coder.com` → us-east-2 NLB
+  - [ ] `*.ai.coder.com` → us-east-2 NLB
+  - [ ] `oregon-proxy.ai.coder.com` → us-west-2 NLB
+  - [ ] `*.oregon-proxy.ai.coder.com` → us-west-2 NLB
+  - [ ] `emea-proxy.ai.coder.com` → eu-west-2 NLB
+  - [ ] `*.emea-proxy.ai.coder.com` → eu-west-2 NLB
 
 ### Subdomain Routing
 
-- [ ] **Test subdomain routing from Oregon**:
+- [ ] **Test subdomain routing from Oregon proxy**:
   ```bash
-  # Example: curl https://test-workspace-oregon.ai.coder.com
+  curl -I https://oregon-proxy.ai.coder.com/healthz
+  # Test wildcard subdomain
+  curl -I https://test-workspace.oregon-proxy.ai.coder.com
   ```
   - Result: _________________
 
-- [ ] **Test subdomain routing from London**:
+- [ ] **Test subdomain routing from London proxy**:
   ```bash
-  # Example: curl https://test-workspace-london.ai.coder.com
+  curl -I https://emea-proxy.ai.coder.com/healthz
+  # Test wildcard subdomain
+  curl -I https://test-workspace.emea-proxy.ai.coder.com
   ```
   - Result: _________________
 
 - [ ] **Test subdomain routing from control plane**:
+  ```bash
+  curl -I https://ai.coder.com/healthz
+  # Test wildcard subdomain
+  curl -I https://test-workspace.ai.coder.com
+  ```
   - Result: _________________
 
 ---
@@ -76,25 +126,98 @@ This checklist ensures all systems are operational and properly configured befor
 
 ### Ephemeral Volume Storage
 
-- [ ] **Check storage capacity per node**:
+- [ ] **Check storage capacity per node across all regions**:
   ```bash
-  # kubectl top nodes
-  # df -h on relevant mount points
+  # us-east-2 (Control Plane)
+  kubectl top nodes --context=us-east-2
+  
+  # us-west-2 (Oregon)
+  kubectl top nodes --context=us-west-2
+  
+  # eu-west-2 (London)
+  kubectl top nodes --context=eu-west-2
   ```
 
-  **Node 1**: _________________% used  
-  **Node 2**: _________________% used  
-  **Node 3**: _________________% used  
-  **Node N**: _________________% used  
+  **us-east-2 Nodes**:
+  - Node 1: _________________% used  
+  - Node 2: _________________% used  
+  - Node N: _________________% used  
+
+  **us-west-2 Nodes**:
+  - Node 1: _________________% used  
+  - Node 2: _________________% used  
+
+  **eu-west-2 Nodes**:
+  - Node 1: _________________% used  
+  - Node 2: _________________% used  
 
 - [ ] **All nodes <60% storage utilization**
 - [ ] **Action Required**: If any node >60%, add capacity or rebalance workloads
 
+### Karpenter Scaling Readiness
+
+- [ ] **Verify Karpenter is operational in all regions**:
+  ```bash
+  # Check Karpenter pods are running
+  kubectl get pods -n karpenter --context=us-east-2
+  kubectl get pods -n karpenter --context=us-west-2
+  kubectl get pods -n karpenter --context=eu-west-2
+  
+  # Check NodePools are ready
+  kubectl get nodepool --context=us-east-2
+  kubectl get nodepool --context=us-west-2
+  kubectl get nodepool --context=eu-west-2
+  ```
+- [ ] **Verify Karpenter NodeClaims are healthy**:
+  ```bash
+  kubectl get nodeclaims -A --context=us-east-2
+  kubectl get nodeclaims -A --context=us-west-2
+  kubectl get nodeclaims -A --context=eu-west-2
+  ```
+
+### Provisioner Scaling
+
+**Current State**: 6 replicas (default org), 2 replicas each (experimental & demo orgs)
+**Recommendation**: Scale to 8-10 replicas for default org if expecting >15 concurrent users
+
+- [ ] **Check current provisioner replica counts**:
+  ```bash
+  kubectl get deployment -n coder -l app=coder-provisioner -o jsonpath='{range .items[*]}{.metadata.name}{"\t"}{.spec.replicas}{"\n"}{end}'
+  ```
+  - Default org provisioners: _________ replicas
+  - Experimental org provisioners: _________ replicas
+  - Demo org provisioners: _________ replicas
+
+- [ ] **Scale provisioners if needed** for workshop:
+  ```bash
+  # Example: Scale default org provisioners to 10 replicas
+  kubectl scale deployment coder-provisioner-default -n coder --replicas=10
+  ```
+  - [ ] Scaled to: _________ replicas for workshop
+
+### LiteLLM Capacity
+
+**Current State**: 4 replicas @ 2 vCPU / 4 GB each
+**Recommendation**: May need scaling for >20 concurrent users
+
+- [ ] **Verify LiteLLM replicas and health**:
+  ```bash
+  kubectl get deployment litellm -n litellm
+  kubectl get pods -n litellm -l app=litellm
+  ```
+  - Current replicas: _________
+  - All pods healthy: ✅ / ❌
+
+- [ ] **If expecting >20 users, consider scaling LiteLLM**:
+  ```bash
+  kubectl scale deployment litellm -n litellm --replicas=6
+  ```
+
 ### Resource Quotas
 
 - [ ] **Verify workspace resource limits** are configured:
-  - CPU limit per workspace: _________________
-  - Memory limit per workspace: _________________
+  - CPU limit per workspace: 2-4 vCPU (template configurable)
+  - Memory limit per workspace: 4-8 GB (template configurable)
   - Storage limit per workspace: _________________
 
 - [ ] **Calculate total capacity**:
@@ -108,43 +231,60 @@ This checklist ensures all systems are operational and properly configured befor
 
 ## 4. Smoke Tests
 
-### Control Plane Region
+### Control Plane Region (us-east-2)
 
-- [ ] **Create test workspace**
+**Available Templates**: 
+- Build from Scratch w/ Claude (2-4 vCPU, 4-8 GB)
+- Build from Scratch w/ Goose (2-4 vCPU, 4-8 GB)
+- Real World App w/ Claude (2-4 vCPU, 4-8 GB)
+
+- [ ] **Create test workspace** using one of the available templates
+  - Template used: _________________
   - Workspace created successfully: ✅ / ❌
   - Time to ready: _________________
+  - Image pulled from ECR successfully: ✅ / ❌
 
-- [ ] **Execute workload in test workspace**
+- [ ] **Execute workload in test workspace**:
+  - [ ] Test Claude Code CLI or Goose CLI (depending on template)
+  - [ ] Verify LiteLLM connectivity
+  - [ ] Test gh CLI authentication (optional GitHub auth)
   - Workload executed successfully: ✅ / ❌
   - Performance acceptable: ✅ / ❌
 
 - [ ] **Delete test workspace**
   - Workspace deleted successfully: ✅ / ❌
   - Resources cleaned up: ✅ / ❌
+  - Provisioner job completed: ✅ / ❌
 
-### Oregon Proxy Cluster
+### Oregon Proxy Cluster (us-west-2)
 
-- [ ] **Create test workspace**
+- [ ] **Create test workspace** via Oregon proxy
+  - Template used: _________________
   - Workspace created successfully: ✅ / ❌
   - Time to ready: _________________
+  - Routed through oregon-proxy.ai.coder.com: ✅ / ❌
 
 - [ ] **Execute workload in test workspace**
   - Workload executed successfully: ✅ / ❌
   - Performance acceptable: ✅ / ❌
+  - LiteLLM accessible from Oregon: ✅ / ❌
 
 - [ ] **Delete test workspace**
   - Workspace deleted successfully: ✅ / ❌
   - Resources cleaned up: ✅ / ❌
 
-### London Proxy Cluster
+### London Proxy Cluster (eu-west-2)
 
-- [ ] **Create test workspace**
+- [ ] **Create test workspace** via London proxy
+  - Template used: _________________
   - Workspace created successfully: ✅ / ❌
   - Time to ready: _________________
+  - Routed through emea-proxy.ai.coder.com: ✅ / ❌
 
 - [ ] **Execute workload in test workspace**
   - Workload executed successfully: ✅ / ❌
   - Performance acceptable: ✅ / ❌
+  - LiteLLM accessible from London: ✅ / ❌
 
 - [ ] **Delete test workspace**
   - Workspace deleted successfully: ✅ / ❌
@@ -184,6 +324,25 @@ This checklist ensures all systems are operational and properly configured befor
 - [ ] **Participant onboarding guide** up to date
 - [ ] **Incident runbook** accessible to workshop team
 - [ ] **Support team** notified and available during workshop
+
+---
+
+## 8. Pre-Workshop Scaling Actions
+
+**Complete 1 day before workshop**:
+
+- [ ] **Scale provisioner replicas** if expecting >15 users (documented above in section 3)
+- [ ] **Scale LiteLLM replicas** if expecting >20 users (documented above in section 3)
+- [ ] **Verify Karpenter has sufficient AWS quota** for expected node scaling:
+  ```bash
+  # Check current node count and instance types
+  kubectl get nodes --show-labels | grep -E 'node.kubernetes.io/instance-type'
+  
+  # Verify AWS EC2 instance limits allow for growth
+  aws service-quotas get-service-quota --service-code ec2 --quota-code L-1216C47A --region us-east-2
+  ```
+- [ ] **Disable or schedule around LiteLLM key rotation** to avoid workspace restarts during workshop
+- [ ] **Notify #help-me-ops** on Slack if any CloudFlare DNS changes are needed
 
 ---
 
